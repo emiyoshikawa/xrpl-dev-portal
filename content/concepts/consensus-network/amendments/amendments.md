@@ -10,7 +10,9 @@ For a complete list of known amendments, their statuses, and IDs, see: [Known Am
 
 ## Background
 
-Any changes to transaction processing could cause servers to build a different ledger with the same set of transactions. If some _validators_ (`rippled` servers [participating in consensus](rippled-server-modes.html#reasons-to-run-a-validator)) have upgraded to a new version of the software while other validators use the old version, this could cause anything from minor inconveniences to full outages. In the minor case, a minority of servers spend more time and bandwidth fetching the actual consensus ledger because they cannot build it using the transaction processing rules they already know. In the worst case, [the consensus process][] might be unable to validate new ledger versions because servers with different rules could not reach a consensus on the exact ledger to build.
+The [consensus process](consensus.html) depends on all servers in the network reaching exactly the same results when processing the same set of transactions. If some validators process transactions in a different way than others, this could lead to delays in validation or even full outages as the network is unable to agree on a consensus outcome.
+
+Any changes to transaction processing could cause servers to build a different ledger from the same set of transactions. If some _validators_ (`rippled` servers [participating in consensus](rippled-server-modes.html#reasons-to-run-a-validator)) have upgraded to a new version of the software while other validators use the old version, this could cause anything from minor inconveniences to full outages. In the minor case, a minority of servers spend more time and bandwidth fetching the actual consensus ledger because they cannot build it using the transaction processing rules they already know. In the worst case, [the consensus process][] might be unable to validate new ledger versions because servers with different rules could not reach a consensus on the exact ledger to build.
 
 Amendments solve this problem, so that new features can be enabled only when enough validators support those features.
 
@@ -23,6 +25,8 @@ Users and businesses who rely on the XRP Ledger can also use Amendments to provi
 
 An amendment is a fully-functional feature or change, waiting to be enabled by the peer-to-peer network as a part of the consensus process. A `rippled` server that wants to use an amendment has code for two modes: without the amendment (old behavior) and with the amendment (new behavior).
 
+Amendments are only appropriate for changes to **transaction processing**. For changes that do not affect servers' ability to build the same exact ledger from the same set of inputs, amendments are unnecessary and undesirable. For example, API changes do not require an amendment.
+
 Every amendment has a unique identifying hex value and a short name. The short name is for human use, and is not used in the amendment process. Two servers can support the same amendment ID while using different names to describe it. An amendment's name is not guaranteed to be unique.
 
 By convention, Ripple's developers use the SHA-512Half hash of the amendment name as the amendment ID.
@@ -30,23 +34,59 @@ By convention, Ripple's developers use the SHA-512Half hash of the amendment nam
 
 ## Amendment Process
 
-Every 256th ledger is called a "flag" ledger. The process of approving an amendment starts in the ledger version immediately before the flag ledger. When `rippled` validator servers send validation messages for that ledger, those servers also submit votes in favor of specific amendments. If a validator does not vote in favor of an amendment, that is the same as voting against the amendment. ([Fee Voting](fee-voting.html) also occurs around flag ledgers.)
+In the amendment process, validators express their preferences for specific amendments, the network tracks when the amendment crosses the 80% threshold for support, and the amendment becomes permanently enabled if it sustains that support for two weeks.
 
-The flag ledger itself has no special contents. However, during that time, the servers look at the votes of the validators they trust, and decide whether to insert an [`EnableAmendment` pseudo-transaction](enableamendment.html) into the following ledger. The flags of an EnableAmendment pseudo-transaction show what the server thinks happened:
+### Amendment Lifecycle
 
-* The `tfGotMajority` flag means that support for the amendment has increased to at least 80% of trusted validators.
-* The `tfLostMajority` flag means that support for the amendment has decreased to less than 80% of trusted validators.
-* An EnableAmendment pseudo-transaction with no flags means that support for the amendment has been enabled. (The change in transaction processing applies to every ledger after this one.)
+![Amendment lifecycle: Open for Voting ←→ Expected → Enabled (final); or, Open for Voting → Rejected (final)](img/amendment-process.png)
 
-A server only inserts the pseudo-transaction to enable an amendment if all of the following conditions are met:
+1. A new amendment is said to be _Open for Voting_ when it has a complete implementation in a stable release of an XRP Ledger server such as `rippled`.
+2. An amendment becomes _Expected_ if at least 80% of trusted validators vote in favor of an amendment. An Expected amendment has a target timestamp two weeks after it gained 80% support.
+3. While an amendment is _Expected_, if support drops below 80%, the amendment returns to _Open for Voting_ status. If it regains support of 80% of validators, it can return to being Expected.
+4. An Expected amendment becomes permanently _Enabled_ if  sustains support of at least 80% of validators through its target timestamp. It becomes recorded in the ledger and can never be disabled.
 
-* The amendment has not already been enabled.
-* A previous ledger includes an EnableAmendment pseudo-transaction for this amendment with the `tfGotMajority` flag enabled.
-* The previous ledger in question is an ancestor of the current ledger.
-* The previous ledger in question has a close time that is at least **two weeks** before the close time of the latest flag ledger.
-* There are no EnableAmendment pseudo-transactions for this amendment with the `tfLostMajority` flag enabled in the consensus ledgers between the `tfGotMajority` pseudo-transaction and the current ledger.
+The XRP Ledger protocol does not include a way to permanently reject a proposed amendment. However, if an amendment has not been enabled and new XRP Ledger server versions do not have an implementation for the proposed amendment, it can be assumed that the amendment won't be enabled in the future. If this happens, the amendment is said to be _Rejected_.
+
+### Technical Details
+
+Validators vote for amendments every time there is a _flag ledger_, approximately every 15 minutes in typical circumstances. A flag ledger is defined as a ledger version whose [ledger index][] is evenly divisible by 256. Votes are sent and tallied in the same way as [Fee Voting](fee-voting.html), over the course of the ledger versions before and after the flag ledger:
+
+1. **Flag ledger - 1:** Alongside their [validations for this ledger version](consensus.html#validation), validators send votes in favor of amendments they would like to see enabled. If a validator does not vote in favor of an amendment, that is the same as voting against the amendment.
+
+2. **Flag ledger:** This ledger has no special contents. However, during this time, servers look at the votes of their trusted validators and evaluate which proposed amendments, if any, have crossed an important threshold.
+3. **Flag ledger +1:** For each amendment that crossed an important threshold, the server inserts an [EnableAmendment pseudo-transaction][] into this ledger. The pseudo-transaction's `Flags` field indicates what type of event occurred:
+
+    - `tfGotMajority` flag: Support for the amendment has increased to at least 80% of trusted validators.
+    - `tfLostMajority` flag: Support for the amendment has decreased to less than 80% of trusted validators.
+    - No flags: The amendment has maintained ≥80% support continuously for at least two weeks. Enable the amendment.
+
+4. **Flag ledger +2:** If an amendment was enabled, its rules take effect starting with this ledger version.
+
+A server only inserts an [EnableAmendment pseudo-transaction][] to enable an amendment if all of the following conditions are met:
+
+- The amendment has not already been enabled.
+- A previous ledger includes an EnableAmendment pseudo-transaction for this amendment with the `tfGotMajority` flag.
+- The previous ledger in question is an ancestor of the current ledger.
+- The previous ledger in question has a close time that is at least **two weeks** before the close time of the latest flag ledger.
+- There are no EnableAmendment pseudo-transactions for this amendment with the `tfLostMajority` flag in the consensus ledgers between the `tfGotMajority` pseudo-transaction and the current ledger.
 
 Theoretically, a `tfLostMajority` EnableAmendment pseudo-transaction could be included in the same ledger as the pseudo-transaction to enable an amendment. In this case, the pseudo-transaction with the `tfLostMajority` pseudo-transaction has no effect.
+
+### Retiring Enabled Amendments
+[Introduced in: rippled 1.5.0][]
+
+After an amendment has been enabled, it cannot be disabled. However, XRP Ledger servers still have the implementation for the pre-amendment behavior. This code applies when evaluating older ledger versions from before the amendment became enabled. These alternate code paths also apply on [parallel networks](parallel-networks.html) that have not enabled the same set of amendments.
+
+There is complexity and maintenance burden involved in supporting code for processing transactions with and without every possible combination of amendments. Therefore, Ripple has proposed a policy for "retiring" enabled amendments after sufficient time has passed:
+
+1. After at least **two years** have passed since the amendment became enabled, remove the code for processing transactions without the amendment. This is called _unconditionalizing_ the amendment.
+
+    When an amendment has become unconditionalized, the XRP Ledger server cannot accurately replay historical ledgers from before the amendment, because the server no longer has the implementation of the legacy behavior. Any cases where the amendment would have applied produce different results. To accurately replay historical transactions from before the amendment became enabled, you must compile a version of the XRP Ledger server that is contemporary with the historical ledger.
+
+2. Introduce a new "roll-up" amendment to fully retire unconditionalized amendments. The only effect of this amendment is to remove unconditionalized amendments from the lists of known amendments in the ledger and the [feature method][].
+
+    Ripple proposes introducing a new roll-up amendment annually, in the next stable release after unconditionalizing the amendments to retire. The first such amendment will be `featureRetire2017Amendments`, and it retires amendments that were enabled in 2017 or earlier.
+
 
 ## Amendment Voting
 
@@ -161,7 +201,7 @@ To find out which features are blocking your `rippled` server, use the [`feature
 
 **Example JSON-RPC Response:**
 
-```
+```json
 {
     "result": {
         "features": {
